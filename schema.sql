@@ -10,7 +10,7 @@ create table if not exists expenses (
   merchant             text,
   description          text,                             -- free-text note
   category             text not null default 'Other'
-    check (category in ('Food','Transport','Shopping','Bills','Entertainment','Groceries','Other')),
+    check (category in ('Food','Transport','Shopping','Bills','Entertainment','Groceries','Family','Other')),
   category_source      text not null default 'manual'   -- 'llm' | 'user_corrected' | 'manual'
     check (category_source in ('llm','user_corrected','manual')),
   category_confidence  numeric(3,2),                     -- 0.00–1.00, null if not LLM-scored

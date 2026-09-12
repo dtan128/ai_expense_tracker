@@ -1,4 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
+import { CATEGORIES, Category } from "./categories";
+
+export { CATEGORIES };
+export type { Category };
 
 const url = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -14,18 +18,6 @@ if (!url || !serviceRoleKey) {
 export const supabase = createClient(url, serviceRoleKey, {
   auth: { persistSession: false },
 });
-
-export const CATEGORIES = [
-  "Food",
-  "Transport",
-  "Shopping",
-  "Bills",
-  "Entertainment",
-  "Groceries",
-  "Other",
-] as const;
-
-export type Category = (typeof CATEGORIES)[number];
 
 export type ExpenseSource = "telegram" | "sms" | "email" | "dashboard";
 export type ExpenseStatus = "confirmed" | "pending_review" | "possible_duplicate";
@@ -94,4 +86,93 @@ export async function deleteExpense(id: string) {
 
 export async function getExpenseById(id: string) {
   return supabase.from("expenses").select("*").eq("id", id).single();
+}
+
+// --- Dashboard queries (Phase 3) ----------------------------------------
+
+function monthRange(month: string): { start: string; end: string } {
+  const [y, m] = month.split("-").map(Number);
+  const start = `${month}-01`;
+  const end = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10); // first day of next month
+  return { start, end };
+}
+
+export async function listExpenses(params: { month: string; category?: Category | "all" }) {
+  const { start, end } = monthRange(params.month);
+  let query = supabase
+    .from("expenses")
+    .select("*")
+    .gte("transaction_date", start)
+    .lt("transaction_date", end)
+    .order("transaction_date", { ascending: false })
+    .order("logged_at", { ascending: false });
+
+  if (params.category && params.category !== "all") {
+    query = query.eq("category", params.category);
+  }
+
+  return query;
+}
+
+export interface MonthSummary {
+  month: string;
+  total: number;
+  byCategory: { category: Category; total: number }[];
+  byDay: { date: string; total: number }[];
+}
+
+export async function getMonthSummary(month: string): Promise<MonthSummary> {
+  const { start, end } = monthRange(month);
+  const { data, error } = await supabase
+    .from("expenses")
+    .select("amount, category, transaction_date")
+    .gte("transaction_date", start)
+    .lt("transaction_date", end);
+
+  if (error || !data) {
+    return { month, total: 0, byCategory: [], byDay: [] };
+  }
+
+  let total = 0;
+  const categoryTotals = new Map<string, number>();
+  const dayTotals = new Map<string, number>();
+
+  for (const row of data) {
+    total += row.amount;
+    categoryTotals.set(row.category, (categoryTotals.get(row.category) ?? 0) + row.amount);
+    dayTotals.set(
+      row.transaction_date,
+      (dayTotals.get(row.transaction_date) ?? 0) + row.amount
+    );
+  }
+
+  const byCategory = CATEGORIES.map((category) => ({
+    category,
+    total: categoryTotals.get(category) ?? 0,
+  }))
+    .filter((c) => c.total !== 0)
+    .sort((a, b) => b.total - a.total);
+
+  const byDay = Array.from(dayTotals.entries())
+    .map(([date, dayTotal]) => ({ date, total: dayTotal }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return { month, total, byCategory, byDay };
+}
+
+export interface UpdateExpenseFields {
+  amount?: number;
+  merchant?: string | null;
+  description?: string | null;
+  category?: Category;
+  status?: ExpenseStatus;
+}
+
+export async function updateExpenseFields(id: string, fields: UpdateExpenseFields) {
+  const update: Record<string, unknown> = { ...fields };
+  if (fields.category) {
+    update.category_source = "user_corrected";
+    if (!fields.status) update.status = "confirmed";
+  }
+  return supabase.from("expenses").update(update).eq("id", id).select().single();
 }

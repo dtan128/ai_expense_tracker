@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard } from "grammy";
 import { CATEGORIES, Category, deleteExpense, insertExpense, updateExpenseCategory } from "./db";
 import { parseManualEntry } from "./parse";
+import { categorizeExpense, CONFIDENCE_THRESHOLD } from "./categorize";
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const allowedUserId = process.env.TELEGRAM_ALLOWED_USER_ID;
@@ -55,23 +56,63 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   if (text.startsWith("/")) return; // let unhandled commands fall through
 
-  const { amount, description } = parseManualEntry(text);
+  const externalId = `telegram:${ctx.chat.id}:${ctx.message.message_id}`;
 
-  if (amount === null) {
-    await ctx.reply(
-      "I couldn't find an amount in that message. Try something like \"12.50 lunch\"."
-    );
-    return;
+  // Try the LLM first for amount/currency/merchant/category. If it fails for
+  // any reason (API down, bad key, malformed response), fall back to the
+  // Phase 1 regex parser so the bot never goes silent on a real message.
+  let amount: number;
+  let currency = "SGD";
+  let merchant: string | null = null;
+  let description: string | null;
+  let category: Category = "Other";
+  let confidence: number | null = null;
+  let categorySource: "llm" | "manual" = "manual";
+
+  try {
+    const result = await categorizeExpense(text);
+
+    if ("error" in result) {
+      await ctx.reply(
+        "I couldn't find an amount in that message. Try something like \"12.50 lunch\"."
+      );
+      return;
+    }
+
+    amount = result.amount;
+    currency = result.currency;
+    merchant = result.merchant;
+    description = merchant ?? text.trim();
+    category = result.category;
+    confidence = result.confidence;
+    categorySource = "llm";
+  } catch (err) {
+    console.error("LLM categorization failed, falling back to regex parse:", err);
+    const parsed = parseManualEntry(text);
+    if (parsed.amount === null) {
+      await ctx.reply(
+        "I couldn't find an amount in that message. Try something like \"12.50 lunch\"."
+      );
+      return;
+    }
+    amount = parsed.amount;
+    description = parsed.description;
   }
 
-  const externalId = `telegram:${ctx.chat.id}:${ctx.message.message_id}`;
+  const belowThreshold = confidence !== null && confidence < CONFIDENCE_THRESHOLD;
+  const status = categorySource === "llm" && !belowThreshold ? "confirmed" : "pending_review";
 
   const { data, error } = await insertExpense({
     amount,
+    currency,
+    merchant,
     description,
+    category,
+    category_source: categorySource,
+    category_confidence: confidence,
     raw_text: text,
     source: "telegram",
-    status: "pending_review",
+    status,
     external_id: externalId,
   });
 
@@ -86,11 +127,25 @@ bot.on("message:text", async (ctx) => {
   }
 
   const amountLabel = `${data.currency} ${Math.abs(data.amount).toFixed(2)}`;
-  await ctx.reply(
-    `Logged ${amountLabel}${description ? ` — ${description}` : ""}.\n` +
-      "What category is this?",
-    { reply_markup: categoryKeyboard(data.id) }
-  );
+  const descLabel = description ? ` — ${description}` : "";
+
+  if (status === "confirmed") {
+    // High-confidence LLM call: show the result with a chance to fix it, not a blank picker.
+    await ctx.reply(
+      `Logged ${amountLabel}${descLabel}\nCategory: ${category} ✅`,
+      { reply_markup: confirmedKeyboard(data.id) }
+    );
+  } else {
+    // Low confidence or LLM unavailable: ask the user to pick, same as Phase 1.
+    const reason =
+      categorySource === "llm"
+        ? ` (I'm only ${Math.round((confidence ?? 0) * 100)}% sure on the category)`
+        : "";
+    await ctx.reply(
+      `Logged ${amountLabel}${descLabel}${reason}\nWhat category is this?`,
+      { reply_markup: categoryKeyboard(data.id) }
+    );
+  }
 });
 
 bot.on("callback_query:data", async (ctx) => {
